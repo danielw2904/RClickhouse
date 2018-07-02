@@ -1,4 +1,5 @@
 #include <stdexcept>
+#include <boost/lexical_cast.hpp>
 #include "result.h"
 
 
@@ -62,16 +63,16 @@ void convertEntries(std::shared_ptr<const CT> in, NullCol nullCol, RT &out,
 }
 
 
-template<>
-void convertEntries<ch::ColumnInt64, Rcpp::StringVector>(std::shared_ptr<const ch::ColumnInt64> in, NullCol nullCol, Rcpp::StringVector &out,
+//template<>
+void convertEntries64(std::shared_ptr<const ch::ColumnInt64> in, NullCol nullCol, std::vector<int64_t> &out,
                     size_t offset, size_t start, size_t end) {
   for(size_t j = start; j < end; j++) {
     // can't use the ternary operator here, since that would require explicit
     // conversion from the Clickhouse storage type (which is far messier)
     if(nullCol && nullCol->IsNull(j)) {
-      out[offset+j-start] = Rcpp::StringVector::get_na();
+      out[offset+j-start] = Rcpp::NumericVector::get_na();
     } else {
-      out[offset+j-start] = std::to_string(in->At(j));
+      out[offset+j-start] = in->At(j);
     }
   }
 }
@@ -145,6 +146,19 @@ void convertEnumEntries(std::shared_ptr<const CT> in, LevelMapT<VT> &levelMap,
   }
 }
 
+Rcpp::NumericVector makeInt64(std::vector<int64_t> v) {
+  size_t len = v.size();
+  Rcpp::NumericVector n(len);         // storage vehicle we return them in
+
+  // transfers values 'keeping bits' but changing type
+  // using reinterpret_cast would get us a warning
+  std::memcpy(&(n[0]), &(v[0]), len * sizeof(double));
+
+  n.attr("class") = "integer64";
+  return n;
+}
+
+
 template<typename CT, typename RT>
 class ScalarConverter : public Converter {
   void processBlocks(Result &r, Result::AccFunc colAcc, Rcpp::List &target,
@@ -166,6 +180,30 @@ class ScalarConverter : public Converter {
     target[targetIdx] = v;
   }
 };
+
+
+class Scalar64Converter : public Converter {
+  void processBlocks(Result &r, Result::AccFunc colAcc, Rcpp::List &target,
+                     size_t start, size_t len, Result::AccFunc nullAcc) {
+    r.convertTypedColumn<ch::ColumnInt64, Rcpp::NumericVector>(colAcc, target, start, len,
+                                 [&nullAcc](const Result::ColBlock &cb, std::shared_ptr<const ch::ColumnInt64> in,
+                                            std::vector<int64_t> &out, size_t offset, size_t start, size_t end) {
+                                   NullCol nullCol =
+                                     nullAcc ? nullAcc(cb)->As<ch::ColumnNullable>() : nullptr;
+                                   convertEntries64(in, nullCol, out, offset, start, end);
+                                 });
+  }
+
+  void processCol(ch::ColumnRef col, Rcpp::List &target, size_t targetIdx,
+                  NullCol nullCol) {
+    auto typedCol = col->As<ch::ColumnInt64>();
+    std::vector<int64_t> v(col->Size());
+    convertEntries64(typedCol, nullCol, v, 0, 0, col->Size());
+    Rcpp::NumericVector cv = makeInt64(v);
+    target[targetIdx] = cv;
+  }
+};
+
 
 class NullableConverter : public Converter {
   using CT = ch::ColumnNullable;
@@ -265,7 +303,7 @@ std::unique_ptr<Converter> Result::buildConverter(std::string name, ch::TypeRef 
     case TC::Int32:
       return std::unique_ptr<ScalarConverter<ch::ColumnInt32, Rcpp::IntegerVector>>(new ScalarConverter<ch::ColumnInt32, Rcpp::IntegerVector>);
     case TC::Int64:
-      return std::unique_ptr<ScalarConverter<ch::ColumnInt64, Rcpp::StringVector>>(new ScalarConverter<ch::ColumnInt64, Rcpp::StringVector>);
+      return std::unique_ptr<Scalar64Converter>(new Scalar64Converter(buildConverter(name, type->GetItemType())));
     case TC::UInt8:
       return std::unique_ptr<ScalarConverter<ch::ColumnUInt8, Rcpp::IntegerVector>>(new ScalarConverter<ch::ColumnUInt8, Rcpp::IntegerVector>);
     case TC::UInt16:
